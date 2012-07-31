@@ -5,6 +5,7 @@
 import base64
 import binascii
 import os
+import os.path
 import re
 import sys
 import urllib2
@@ -15,6 +16,11 @@ import string
 import time
 import xbmc, xbmcplugin, xbmcgui, xbmcaddon, utils
 import datetime
+import pycurl
+import Queue
+import threading
+import random
+import socks
 
 from Navigator import Navigator
 
@@ -25,7 +31,15 @@ __addon__ = __addoninfo__["addon"]
 __settings__   = xbmcaddon.Addon(id=__scriptid__)
 DIR_USERDATA   = xbmc.translatePath(__addoninfo__["profile"])
 
+class CurlData(object):
+	def __init__(self):
+		self.contents = ''
+	
+	def body_callback(self, buf):
+		self.contents = self.contents + buf
 
+	def reset(self):
+		self.contents = ''
 
 class BBCDL( object ):
 	
@@ -35,7 +49,21 @@ class BBCDL( object ):
 		except:
 			print "Output Filename must be set"
 			exit (-1)
-		#self.outputfile       = "C:/bbcsport.flv"
+		self.pipeHandle = None
+		if os.name == 'nt':
+			self.outputfile = '\\\\.\\pipe\\bbcsports.flv'
+			# Create the named pipe
+			import win32file, win32pipe
+			self.pipeHandle = win32pipe.CreateNamedPipe(self.outputfile, win32pipe.PIPE_ACCESS_DUPLEX, win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT, 50, 4096, 4096, 10000, None)
+			if self.pipeHandle == win32file.INVALID_HANDLE_VALUE:
+				print "Fatal: Couldn't create named pipe. Exiting."
+				exit (-1)
+		else:
+			# Create the FIFO
+			if os.path.exists(self.outputfile):
+				os.unlink(self.outputfile)
+			os.mkfifo(self.outputfile)
+			
 		self.url              = url
 		self.proxy            = proxy
 		self.navigator        = Navigator( self.proxy )
@@ -61,18 +89,20 @@ class BBCDL( object ):
 		self.prevAAC_Header    = False
 		self.AVC_HeaderWritten = False
 		self.AAC_HeaderWritten = False
+		self.dataQueue         = Queue.Queue(50)
+		self.dataThread        = None
+		self.dataThreadKill    = False
+		self.dataWritten       = False
+		self.needNewBootstrap  = False
 		self.flvHeader = bytearray.fromhex(unicode('464c5601050000000900000000'))
 		self.flvHeaderLen = len(self.flvHeader)
+
+
+
+	def run(self):
+		print "Started download thread"
 		flv = None
 
-
-
-
-		
-		try:
-			os.remove(self.outputfile)
-		except:
-			pass
 		self.baseUrl = self.url[0: self.url.rfind("/")]
 		# Get the manifest
 		self.manifest = self.navigator.getFile(self.url)
@@ -86,45 +116,131 @@ class BBCDL( object ):
 
 		self.baseFilename = (self.streamid.attrib["streamId"] + "Seg%d" + "-Frag") % (segNum)
 		self.fragUrl = self.baseUrl + "/" + self.streamid.attrib["url"]
-		
-		while (fragNum < self.fragCount):
-			
-			fragNum = fragNum + 1
-			sys.stdout.write("Downloading %d/%d fragments\r" % (fragNum, self.fragCount))
-			for i in range (0, self.fragEntries):
-				if self.fragTable[i,0] == fragNum:
-					self.discontinuity = self.fragTable[i,3]
-					if ((self.discontinuity == 1) or (self.discontinuity == 3)):
-						self.rename = True
-						continue
-				i = i+1
-			filename = (self.baseFilename + "%d") % fragNum
-			#print filename
-			if os.path.exists(filename):
-				continue
-			if (self.segNum > 1):
-				if (fragNum > (segNum * self.fragsPerSeg)):
-					segNum = segNum + 1
-				elif (fragNum <= ((segNum - 1) * self.fragsPerSeg)):
-					segNum = segNum - 1
-			filename1 = (self.fragUrl + "Seg%d" + "-Frag%d") % (segNum, fragNum)
-			filename2 = (self.baseFilename + "%d") % (fragNum)
-			fragData = self.navigator.getFile(filename1)
-			#self.audio = False
-			#self.video = False
-			if (flv is None):
-				flvData = self.DecodeFragment(fragData, fragNum, None)
-				self.start = datetime.datetime.now()
-				#flv = self.WriteFlvFile("C:/" + self.baseFilename + ".flv", self.audio, self.video)
-				flv = self.WriteFlvFile(self.outputfile, self.audio, self.video)
-				flv.write(flvData)
+
+		# Kick off the data fetching thread
+		self.dataThread = threading.Thread(target=self.runDataThread)
+		self.dataThread.start()	
+
+		while not self.dataThreadKill:
+			fragNum, data = self.dataQueue.get()
+
+			if fragNum is None:
+				# New bootstrap info for us
+				sys.stdout.write("Updating bootstrap info")
+				self.UpdateBootstrapInfoWithData(data)
 			else:
-				self.DecodeFragment(fragData, fragNum, flv)
-			
-			if (fragNum == self.fragCount):
-				self.UpdateBootstrapInfo(self.urlbootstrap);
+				sys.stdout.write("Decoding fragment %d of %d\r" % (fragNum, self.fragCount))
+				# Create the FLV if it doesn't exist
+				if (flv is None):
+					self.start = datetime.datetime.now()
+					flvData = self.DecodeFragment(data, fragNum, None)
+					#flv = self.WriteFlvFile("C:/" + self.baseFilename + ".flv", self.audio, self.video)
+					self.dataWritten = True
+					flv = self.WriteFlvFile(self.outputfile, self.audio, self.video)
+					flv.write(flvData)
+				else:
+					self.DecodeFragment(data, fragNum, flv)
+				
+
+			self.dataQueue.task_done()
+
+		if self.pipeHandle:
+			self.pipeHandle.Close()
+			self.pipeHandle = None
 		exit(-1)
 		
+	def runDataThread(self):
+	        listeUserAgents = [ 'Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_5_5; fr-fr) AppleWebKit/525.18 (KHTML, like Gecko) Version/3.1.2 Safari/525.20.1',
+        	                                        'Mozilla/5.0 (Windows NT 6.1) AppleWebKit/535.1 (KHTML, like Gecko) Chrome/14.0.835.186 Safari/535.1',
+                	                                'Mozilla/5.0 (Windows; U; Windows NT 6.0; en-US) AppleWebKit/525.13 (KHTML, like Gecko) Chrome/0.2.149.27 Safari/525.13',
+                        	                        'Mozilla/5.0 (X11; U; Linux x86_64; en-us) AppleWebKit/528.5+ (KHTML, like Gecko, Safari/528.5+) midori',
+                                	                'Mozilla/5.0 (Windows NT 6.0) AppleWebKit/535.1 (KHTML, like Gecko) Chrome/13.0.782.107 Safari/535.1',
+                                        	        'Mozilla/5.0 (Macintosh; U; PPC Mac OS X; en-us) AppleWebKit/312.1 (KHTML, like Gecko) Safari/312',
+                                                	'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/535.11 (KHTML, like Gecko) Chrome/17.0.963.12 Safari/535.11',
+	                                                'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/535.8 (KHTML, like Gecko) Chrome/17.0.940.0 Safari/535.8' ]
+		# Init curl
+		c = pycurl.Curl()
+		data = CurlData()
+		c.setopt(c.WRITEFUNCTION, data.body_callback)
+		c.setopt(pycurl.TIMEOUT, 30)
+		# Set up user agent
+		c.setopt(c.USERAGENT, random.choice(listeUserAgents))
+		# And proxy
+		if self.proxy:
+			if self.proxy[0] != socks.PROXY_TYPE_HTTP_NO_TUNNEL:
+				# Set generic options
+				c.setopt(c.PROXY, self.proxy[1])
+				c.setopt(c.PROXYPORT, self.proxy[2])
+				c.setopt(c.PROXYUSERPWD, "%s:%s" % (self.proxy[4],self.proxy[5]))
+			if self.proxy[0] == socks.PROXY_TYPE_HTTP:
+				c.setopt(c.PROXYTYPE_HTTP)
+			elif self.proxy[0] == socks.PROXY_TYPE_SOCKS4:
+				c.setopt(c.PROXYTYPE_SOCKS4)
+			elif self.proxy[0] == socks.PROXY_TYPE_SOCKS5:
+				# pycurl doesn't seem to define c.PROXYTYPE_SOCKS5_HOSTNAME, so use the URL prefix method instead
+				c.setopt(c.PROXY, "socks5h://%s" % (self.proxy[1]))
+				#c.setopt(c.PROXYTYPE_SOCKS5)
+			
+		# Set up our fragment vars
+		segNum = self.segNum
+		fragNum = self.fragNum
+		retries = 3
+
+		while not self.dataThreadKill:
+			data.reset()
+			if self.needNewBootstrap:
+				# Download a new bit of bootstrap info
+				c.setopt(c.URL, self.urlbootstrap)
+				try:
+					c.perform()	
+					self.dataQueue.put((None, data.contents))
+					self.needNewBootstrap = False
+				except Exception as e:
+					print "Curl failed to fetch new bootstrap data: %s" % e.strerror
+			else:
+				# Download the next fragment
+				fragNum = fragNum + 1
+				if (self.segNum > 1):
+					if (fragNum > (segNum * self.fragsPerSeg)):
+						segNum = segNum + 1
+						# Segment change, update bootstrap to get new fragsPerSeg
+						self.needNewBootstrap = True
+					elif (fragNum <= ((segNum - 1) * self.fragsPerSeg)):
+						segNum = segNum - 1
+						# Segment change, update bootstrap to get new fragsPerSeg
+						self.needNewBootstrap = True
+				filename1 = (self.fragUrl + "Seg%d" + "-Frag%d") % (segNum, fragNum)
+				c.setopt(c.URL, filename1)
+				try:
+					c.perform()
+					if(len(data.contents) < 1000):
+						print "No more data available - waiting a bit."
+						time.sleep(0.5)
+						fragNum = fragNum - 1
+						continue
+					retries = 3
+					self.dataQueue.put((fragNum, data.contents))
+				except Exception as e:
+					retries = retries - 1
+					if retries > 0:
+						# If we're retrying, roll back the fragNum
+						fragNum = fragNum - 1
+					else:
+						print "Couldn't download fragment %d" % fragNum
+		c.close()
+
+	def UpdateBootstrapInfoWithData(self, bootstrapData):
+		bootstrapPos = 0
+		origFragCount = self.fragCount
+		self.ReadBoxHeader(bootstrapData, bootstrapPos, None, None)
+		bootstrapPos = self.pos
+		if (self.boxType == "abst"):
+			self.ParseBootstrapBox(bootstrapData, bootstrapPos)
+		if origFragCount == self.fragCount:
+			self.needNewBootstrap = True
+		else:
+			print "New fragment count is: %d" % self.fragCount
+
 	def UpdateBootstrapInfo(self, bootstrapUrl):
 		retries = 0
 		fragNum = self.fragCount
@@ -329,6 +445,7 @@ class BBCDL( object ):
 		fragPos = 0
 		boxSize = 0
 		fragLen = len(frag)
+		packetTS = None
 		while (fragPos < fragLen):
 			self.ReadBoxHeader(frag, fragPos, None, None)
 			if (self.boxType == "mdat"):
@@ -384,6 +501,7 @@ class BBCDL( object ):
 								self.stop = datetime.datetime.now()
 								elapsed = self.stop - self.start
 								if (elapsed > datetime.timedelta(seconds=25)):
+									self.dataThreadKill = True
 									print "Downloads Killed"
 									exit(-1)
 								else:
@@ -443,6 +561,7 @@ class BBCDL( object ):
 							self.stop = datetime.datetime.now()
                                                         elapsed = self.stop - self.start
                                                         if (elapsed > datetime.timedelta(seconds=25)):
+								                            self.dataThreadKill = True
                                                         	print "Downloads Killed"
                                                                 exit(-1)
                                                         else:
@@ -477,7 +596,7 @@ class BBCDL( object ):
 				exit (-1)
 			
 			fragPos = fragPos +  totalTagLen
-		if (self.baseTS is not False):
+		if (self.baseTS is not False and packetTS):
 			self.duration = round((packetTS - self.baseTS) / 1000, 0)
 		return flvData
 			

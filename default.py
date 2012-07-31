@@ -1,4 +1,5 @@
-import urllib,urllib2, re,sys,socket,os,md5,datetime,xbmcplugin,xbmcgui, xbmcaddon
+import urllib,urllib2, re,sys,socket,os,md5,datetime,xbmcplugin,xbmcgui, xbmcaddon, threading
+import os, os.path
 import thread
 
 # external libs
@@ -278,23 +279,37 @@ def VIDEO(url):
 	#thumbfile = os.path.join(IMAGE_DIR, image_name)
 	#listitem.setThumbnailImage(thumbfile)
 	#listitem.setInfo('video', {'Title': title2[0]})
-	thread.start_new_thread(BBCDL,(url,))
+	proxy = get_proxy()
+	if proxy[0] == socks.PROXY_TYPE_HTTP_NO_TUNNEL:
+		proxy = None
+	downloader = BBCDL(url,proxy)
+	dlThread = threading.Thread(target=downloader.run)
+	dlThread.start()
 	progress = xbmcgui.DialogProgress()
 	progress.create('Starting Stream')
-	stream_delay = 10
-	try:
-		stream_delay = __settings__.getSetting('stream_delay')
-	except:
-		pass
-	time.sleep(float(stream_delay))
 	mplayer = MyPlayer()
 	try:
 		filename = __settings__.getSetting('download_folder') + "bbcsports.flv"
 	except:
 		exit (-1)
+	if os.name == 'nt':
+		filename = '\\\\.\\pipe\\bbcsports.flv'
+	# Wait for stream to begin
+	while not downloader.dataWritten:
+		print "Waiting for data to be written"
+		time.sleep(1)
+	# Wait a second to let the data actually be written - we have to set the flag before
+	# the data is really written, as FIFO writes are blocking
+	time.sleep(1)
+	# It hath begun!
 	progress.close()
 	mplayer.play(filename,listitem)
-	time.sleep(3)
+	time.sleep(10)
+	# Wait till it finishes playing, and kill the thread
+	while xbmc.Player().isPlaying():
+		time.sleep(10)
+	print "Finished playing"
+	downloader.dataThreadKill = True
 	#while xbmc.Player().isPlaying():
 	#	print "Playing"
 	#	xbmc.sleep(100)

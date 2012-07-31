@@ -35,8 +35,6 @@ class Navigator:
 	def __init__( self, proxy = None ):
 		import socks
 		import socket
-		socks.setdefaultproxy(socks.PROXY_TYPE_SOCKS5, "dlake-radio.lake.to", 1081)
-		socket.socket = socks.socksocket
 		import urllib2
 		self.proxy = proxy
 		
