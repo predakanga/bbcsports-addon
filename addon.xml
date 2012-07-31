@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.bbcsport"
+       name="BBC Sport"
+       version="0.0.2"
+       provider-name="dlake02">
+  <requires>
+    <import addon="xbmc.python" version="1.0"/>
+  </requires>
+  <extension point="xbmc.python.pluginsource"
+            library="default.py">
+        <provides>video</provides>
+  </extension>
+  <extension point="xbmc.addon.metadata">
+    <platform>all</platform>
+    <summary>BBC Sports channels</summary>
+    <description>24 channels of live sport from the BBC</description>
+  </extension>
+</addon>
